@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# slotdeploy-push - put the current work on the preview branch, safely.
+#
+# Your work is committed to a work branch and backed up to the remote, then
+# the preview branch is pointed at it. It never pushes to protected branches
+# (main/master), and it never runs reset or stash, so local files stay as they are.
+set -euo pipefail
+
+PROG="slotdeploy-push"
+VERSION="0.1.0"
+
+usage() {
+  cat <<'EOF'
+Usage: slotdeploy-push <command>
+
+Commands:
+  start                       New work branch from the latest preview
+  push ["MESSAGE"]            Commit everything, back up the branch, update preview
+  rollback prev|yesterday|COMMIT
+                              Point preview back (aliases: 이전, 어제). Files are untouched
+  status                      Show your branch and what preview points at
+
+Settings (environment, or git config):
+  SLOTDEPLOY_REMOTE    slotdeploy.remote     default: origin
+  SLOTDEPLOY_BRANCH    slotdeploy.branch     default: preview
+  SLOTDEPLOY_PREFIX    slotdeploy.prefix     default: work/
+  SLOTDEPLOY_PROTECTED slotdeploy.protected  default: "main master"
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+
+setting() { # ENV_NAME git_key default
+  local v
+  v=$(printenv "$1" || true)
+  [ -n "$v" ] || v=$(git config --get "$2" 2>/dev/null || true)
+  [ -n "$v" ] || v=$3
+  printf '%s' "$v"
+}
+
+init() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
+  REMOTE=$(setting SLOTDEPLOY_REMOTE slotdeploy.remote origin)
+  PREVIEW=$(setting SLOTDEPLOY_BRANCH slotdeploy.branch preview)
+  PREFIX=$(setting SLOTDEPLOY_PREFIX slotdeploy.prefix work/)
+  PROTECTED=$(setting SLOTDEPLOY_PROTECTED slotdeploy.protected "main master")
+  git remote get-url "$REMOTE" >/dev/null 2>&1 || die "git remote '$REMOTE' not found"
+  if is_protected "$PREVIEW"; then
+    die "preview branch '$PREVIEW' is listed as protected; refusing to force-push it"
+  fi
+  HISTORY="$(git rev-parse --git-common-dir)/slotdeploy-history"
+  IDENT=()
+  if [ -z "$(git config --get user.name || true)" ] || [ -z "$(git config --get user.email || true)" ]; then
+    IDENT=(-c "user.name=${USER:-slotdeploy}" -c "user.email=${USER:-slotdeploy}@localhost")
+  fi
+}
+
+is_protected() {
+  case " $PROTECTED " in *" $1 "*) return 0 ;; esac
+  return 1
+}
+
+short() { git rev-parse --short "$1" 2>/dev/null || printf '%.7s' "$1"; }
+
+subject() { git log -1 --format=%s "$1" 2>/dev/null || true; }
+
+current_branch() { git symbolic-ref --quiet --short HEAD 2>/dev/null || true; }
+
+remote_preview() {
+  git ls-remote --heads "$REMOTE" "refs/heads/$PREVIEW" |
+    awk -v r="refs/heads/$PREVIEW" '$2 == r { print $1 }'
+}
+
+new_branch_name() {
+  local base n=2 name
+  base="$PREFIX$(date +%Y%m%d-%H%M%S)"
+  name=$base
+  while git show-ref --verify --quiet "refs/heads/$name"; do
+    name="$base-$n"
+    n=$((n + 1))
+  done
+  printf '%s' "$name"
+}
+
+remember() { # sha
+  [ -n "$1" ] || return 0
+  [ "$(tail -n 1 "$HISTORY" 2>/dev/null | cut -d' ' -f2)" != "$1" ] || return 0
+  printf '%s %s\n' "$(date +%s)" "$1" >>"$HISTORY"
+}
+
+start_of_today() {
+  local now h m s
+  read -r now h m s <<EOF
+$(date '+%s %H %M %S')
+EOF
+  printf '%s' $((now - 10#$h * 3600 - 10#$m * 60 - 10#$s))
+}
+
+cmd_start() {
+  local base name
+  [ -z "$(git status --porcelain)" ] ||
+    die "you have unsaved changes. Run: $PROG push \"what you changed\" (nothing was touched)"
+  git fetch --quiet "$REMOTE"
+  if git rev-parse --verify --quiet "refs/remotes/$REMOTE/$PREVIEW" >/dev/null; then
+    base="$REMOTE/$PREVIEW"
+  else
+    base=$(git symbolic-ref --quiet --short "refs/remotes/$REMOTE/HEAD" 2>/dev/null || true)
+    [ -n "$base" ] || die "'$REMOTE/$PREVIEW' does not exist yet and the remote default branch is unknown"
+  fi
+  name=$(new_branch_name)
+  git checkout --quiet --no-track -b "$name" "$base"
+  say "Started $name from $base ($(short HEAD) \"$(subject HEAD)\")."
+}
+
+cmd_push() {
+  local msg=${1:-preview update} branch head old moved=""
+  branch=$(current_branch)
+  if [ -z "$branch" ] || is_protected "$branch" || [ "$branch" = "$PREVIEW" ]; then
+    # Carry the uncommitted changes onto a fresh work branch; the old branch is left as it was.
+    branch=$(new_branch_name)
+    git checkout --quiet -b "$branch"
+    moved=1
+  fi
+  git add -A
+  if ! git diff --cached --quiet; then
+    git ${IDENT[@]+"${IDENT[@]}"} commit --quiet -m "$msg"
+  fi
+  head=$(git rev-parse HEAD)
+  git push --quiet "$REMOTE" "HEAD:refs/heads/$branch" ||
+    die "could not back up $branch to $REMOTE (preview not changed)"
+  old=$(remote_preview)
+  [ -n "$moved" ] && say "Your changes are on a new branch: $branch"
+  if [ "$old" = "$head" ]; then
+    say "Preview already shows $(short "$head") \"$(subject "$head")\". Nothing to do."
+    return 0
+  fi
+  remember "$old"
+  git push --quiet --force "$REMOTE" "HEAD:refs/heads/$PREVIEW"
+  remember "$head"
+  say "Preview -> $(short "$head") \"$(subject "$head")\" (backup: $branch)."
+  say "The preview server picks it up in 1-2 minutes. If the build fails, it keeps showing the previous version."
+}
+
+cmd_rollback() {
+  local target=${1:-} cur sha="" midnight
+  [ -n "$target" ] || die "usage: $PROG rollback prev|yesterday|COMMIT"
+  git fetch --quiet "$REMOTE"
+  cur=$(remote_preview)
+  [ -n "$cur" ] || die "'$PREVIEW' does not exist on $REMOTE"
+  case $target in
+    prev | previous | 이전 | 방금)
+      sha=$(awk -v c="$cur" '$2 != c { s = $2 } END { print s }' "$HISTORY" 2>/dev/null || true)
+      [ -n "$sha" ] || sha=$(git rev-parse --verify --quiet "$cur^" || true)
+      ;;
+    yesterday | 어제)
+      midnight=$(start_of_today)
+      sha=$(awk -v m="$midnight" '$1 < m { s = $2 } END { print s }' "$HISTORY" 2>/dev/null || true)
+      [ -n "$sha" ] || sha=$(git rev-list -1 --before="@$midnight" "$cur" 2>/dev/null || true)
+      ;;
+    *)
+      sha=$(git rev-parse --verify --quiet "$target^{commit}") || die "unknown commit: $target"
+      ;;
+  esac
+  [ -n "$sha" ] || die "no earlier preview found for '$target'"
+  git cat-file -e "$sha^{commit}" 2>/dev/null || die "commit $sha is not available locally"
+  if [ "$sha" = "$cur" ]; then
+    say "Preview already shows $(short "$sha") \"$(subject "$sha")\"."
+    return 0
+  fi
+  remember "$cur"
+  git push --quiet --force "$REMOTE" "$sha:refs/heads/$PREVIEW"
+  remember "$sha"
+  say "Preview rolled back: $(short "$cur") -> $(short "$sha") \"$(subject "$sha")\"."
+  say "Your files were not changed. The preview server updates in 1-2 minutes."
+}
+
+cmd_status() {
+  local branch cur changed
+  branch=$(current_branch)
+  changed=$(git status --porcelain | wc -l | tr -d ' ')
+  say "branch:  ${branch:-(detached)}, $changed unsaved change(s)"
+  git fetch --quiet "$REMOTE" || true
+  cur=$(remote_preview)
+  if [ -n "$cur" ]; then
+    say "preview: $(short "$cur") \"$(subject "$cur")\""
+    if [ "$cur" = "$(git rev-parse HEAD)" ]; then
+      say "         = your current commit"
+    fi
+  else
+    say "preview: not created yet"
+  fi
+  if [ -s "$HISTORY" ]; then
+    say "recent preview commits (newest last):"
+    tail -n 5 "$HISTORY" | while read -r ts sha; do
+      printf '  %s  %s  %s\n' "$(date -r "$ts" '+%m-%d %H:%M' 2>/dev/null || date -d "@$ts" '+%m-%d %H:%M')" "$(short "$sha")" "$(subject "$sha")"
+    done
+  fi
+}
+
+main() {
+  local cmd=${1:-help}
+  [ $# -eq 0 ] || shift
+  case $cmd in
+    -h | --help | help) usage; return 0 ;;
+    version | --version) echo "$PROG $VERSION"; return 0 ;;
+  esac
+  init
+  case $cmd in
+    start) cmd_start ;;
+    push) cmd_push "$@" ;;
+    rollback) cmd_rollback "$@" ;;
+    status) cmd_status ;;
+    *) usage >&2; return 2 ;;
+  esac
+}
+
+main "$@"

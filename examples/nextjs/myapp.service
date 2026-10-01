@@ -1,0 +1,14 @@
+# The app itself. It always runs whatever /srv/myapp/current points at.
+[Unit]
+Description=myapp preview (Next.js)
+After=network.target
+
+[Service]
+User=deploy
+WorkingDirectory=/srv/myapp/current
+Environment=NODE_ENV=production PORT=3000
+ExecStart=/usr/bin/npm start
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

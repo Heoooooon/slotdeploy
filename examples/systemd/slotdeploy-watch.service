@@ -1,0 +1,12 @@
+# One check: deploy if the preview branch moved. Triggered by slotdeploy-watch.timer.
+[Unit]
+Description=slotdeploy: check the preview branch and deploy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+ExecStart=/usr/local/bin/slotdeploy -c /srv/myapp/slotdeploy.env watch
+# A failed build is already logged to /srv/myapp/slotdeploy.log; do not mark the unit failed for it.
+SuccessExitStatus=1

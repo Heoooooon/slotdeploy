@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- macOS: cp to ~/Library/LaunchAgents/ then
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.slotdeploy.plist -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.slotdeploy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/slotdeploy</string>
+    <string>-c</string>
+    <string>/Users/deploy/site/slotdeploy.env</string>
+    <string>watch</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/tmp/slotdeploy.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/slotdeploy.err.log</string>
+</dict>
+</plist>

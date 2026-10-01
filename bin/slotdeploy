@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# slotdeploy - two-slot, health-checked preview deploys from a git branch.
+#
+# Builds the new commit in the idle slot, switches a symlink only when the
+# build passes, and switches back when the service does not come up healthy.
+# A failed commit never replaces the build that is currently live.
+set -euo pipefail
+
+VERSION="0.1.0"
+PROG="slotdeploy"
+
+usage() {
+  cat <<'EOF'
+Usage: slotdeploy [-c CONFIG] <command>
+
+Commands:
+  watch [--every SECONDS]  Deploy if the watched branch moved (one check, or loop)
+  deploy [REF]             Build REF (default: tip of the watched branch) now
+  status                   Show the live slot, commit and recent log lines
+  version                  Print the version
+
+Config: -c PATH, or $SLOTDEPLOY_CONFIG, or ./slotdeploy.env
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- config
+
+CFG_REPO_URL=""
+CFG_BRANCH="preview"
+CFG_ROOT=""
+CFG_INSTALL_CMD=""
+CFG_BUILD_CMD=""
+CFG_CHECK_CMD=""
+CFG_RESTART_CMD=""
+CFG_HEALTH_URL=""
+CFG_HEALTH_RETRIES="30"
+CFG_HEALTH_INTERVAL="2"
+CFG_KEEP="node_modules"
+CFG_SHARED_DIR=""
+
+expand_home() {
+  case $1 in
+    \~) printf '%s' "$HOME" ;;
+    \~/*) printf '%s/%s' "$HOME" "${1#\~/}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# KEY=value lines; values are never evaluated by the shell when loading.
+load_config() {
+  local file=$1 line key val n=0
+  [ -f "$file" ] || die "config not found: $file (use -c PATH)"
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line=${line%$'\r'}
+    line="${line#"${line%%[![:space:]]*}"}"
+    case $line in '' | '#'*) continue ;; esac
+    case $line in *=*) ;; *) die "$file:$n: expected KEY=value" ;; esac
+    key=${line%%=*}
+    val=${line#*=}
+    key="${key%"${key##*[![:space:]]}"}"
+    case $val in
+      \"*\") val=${val#\"}; val=${val%\"} ;;
+      \'*\') val=${val#\'}; val=${val%\'} ;;
+    esac
+    case $key in
+      REPO_URL | BRANCH | ROOT | INSTALL_CMD | BUILD_CMD | CHECK_CMD | RESTART_CMD | \
+        HEALTH_URL | HEALTH_RETRIES | HEALTH_INTERVAL | KEEP | SHARED_DIR)
+        printf -v "CFG_$key" '%s' "$val" ;;
+      *) die "$file:$n: unknown key '$key'" ;;
+    esac
+  done <"$file"
+
+  CFG_ROOT=$(expand_home "$CFG_ROOT")
+  CFG_SHARED_DIR=$(expand_home "$CFG_SHARED_DIR")
+  [ -n "$CFG_REPO_URL" ] || die "$file: REPO_URL is required"
+  [ -n "$CFG_ROOT" ] || die "$file: ROOT is required"
+  case $CFG_ROOT in /*) ;; *) die "$file: ROOT must be an absolute path" ;; esac
+  case $CFG_BRANCH in '' | *[[:space:]]*) die "$file: BRANCH is invalid" ;; esac
+  case $CFG_HEALTH_RETRIES in '' | *[!0-9]* | 0) die "$file: HEALTH_RETRIES must be a positive number" ;; esac
+  case $CFG_HEALTH_INTERVAL in '' | *[!0-9]*) die "$file: HEALTH_INTERVAL must be a number of seconds" ;; esac
+
+  SLOTS="$CFG_ROOT/slots"
+  CURRENT="$CFG_ROOT/current"
+  STATE="$CFG_ROOT/state"
+  LOGFILE="$CFG_ROOT/slotdeploy.log"
+  BUILDLOG="$CFG_ROOT/logs/last-build.log"
+  LOCKDIR="$CFG_ROOT/.lock"
+}
+
+# ---------------------------------------------------------------- helpers
+
+logline() {
+  local line
+  line="$(date '+%Y-%m-%d %H:%M:%S') $*"
+  printf '%s\n' "$line" >>"$LOGFILE"
+  printf '%s\n' "$line"
+}
+
+LOCK_HELD=""
+
+acquire_lock() {
+  local pid
+  if mkdir "$LOCKDIR" 2>/dev/null; then
+    printf '%s\n' "$$" >"$LOCKDIR/pid"
+    LOCK_HELD=1
+    return 0
+  fi
+  pid=$(cat "$LOCKDIR/pid" 2>/dev/null || true)
+  if [ -z "$pid" ] || kill -0 "$pid" 2>/dev/null; then
+    printf '%s: another deploy is running (pid %s); skipping\n' "$PROG" "${pid:-?}" >&2
+    return 1
+  fi
+  # The previous run died without cleaning up.
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" 2>/dev/null || return 1
+  printf '%s\n' "$$" >"$LOCKDIR/pid"
+  LOCK_HELD=1
+}
+
+release_lock() {
+  if [ -n "$LOCK_HELD" ]; then
+    rm -rf "$LOCKDIR"
+    LOCK_HELD=""
+  fi
+}
+trap release_lock EXIT
+
+check_current_is_link() {
+  if [ -e "$CURRENT" ] && [ ! -L "$CURRENT" ]; then
+    die "$CURRENT exists and is not a symlink; move it away before the first deploy"
+  fi
+}
+
+live_slot() {
+  case $(readlink "$CURRENT" 2>/dev/null || true) in
+    slots/a | */slots/a) echo a ;;
+    slots/b | */slots/b) echo b ;;
+    *) echo "" ;;
+  esac
+}
+
+slot_sha() { git -C "$SLOTS/$1" rev-parse HEAD 2>/dev/null || true; }
+
+# Point "current" at a slot with an atomic rename (or remove it when empty).
+point_current() {
+  local slot=$1 tmp="$CFG_ROOT/.current.$$"
+  if [ -z "$slot" ]; then
+    rm -f "$CURRENT"
+    return 0
+  fi
+  ln -sfn "slots/$slot" "$tmp"
+  # GNU mv needs -T, BSD/macOS mv needs -h, so a symlink to a directory is replaced, not entered.
+  mv -Tf "$tmp" "$CURRENT" 2>/dev/null || mv -hf "$tmp" "$CURRENT"
+}
+
+run_step() { # slot sha command
+  (
+    cd "$SLOTS/$1"
+    SLOTDEPLOY_SLOT=$1 SLOTDEPLOY_SHA=$2 SLOTDEPLOY_ROOT=$CFG_ROOT bash -c "$3"
+  ) </dev/null >>"$BUILDLOG" 2>&1
+}
+
+prepare_slot() { # slot ref -> prints resolved sha
+  local dir="$SLOTS/$1" ref=$2 sha k
+  local -a excludes=()
+  if [ ! -d "$dir/.git" ]; then
+    rm -rf "$dir"
+    git clone --quiet --no-checkout "$CFG_REPO_URL" "$dir" >>"$BUILDLOG" 2>&1 || return 1
+  fi
+  git -C "$dir" remote set-url origin "$CFG_REPO_URL"
+  git -C "$dir" fetch --quiet --prune --force origin '+refs/heads/*:refs/remotes/origin/*' >>"$BUILDLOG" 2>&1 || return 1
+  sha=$(git -C "$dir" rev-parse --verify --quiet "origin/$ref^{commit}" ||
+    git -C "$dir" rev-parse --verify --quiet "$ref^{commit}") || {
+    echo "unknown ref: $ref" >>"$BUILDLOG"
+    return 1
+  }
+  git -C "$dir" checkout --quiet --force --detach "$sha" >>"$BUILDLOG" 2>&1 || return 1
+  set -f
+  for k in $CFG_KEEP; do excludes+=(-e "$k"); done
+  set +f
+  git -C "$dir" clean -qffdx ${excludes[@]+"${excludes[@]}"} >>"$BUILDLOG" 2>&1 || return 1
+  if [ -n "$CFG_SHARED_DIR" ]; then
+    [ -d "$CFG_SHARED_DIR" ] || { echo "SHARED_DIR not found: $CFG_SHARED_DIR" >>"$BUILDLOG"; return 1; }
+    cp -R "$CFG_SHARED_DIR/." "$dir/" >>"$BUILDLOG" 2>&1 || return 1
+  fi
+  printf '%s\n' "$sha"
+}
+
+healthy() {
+  local i=0
+  [ -n "$CFG_HEALTH_URL" ] || return 0
+  while :; do
+    if curl -fsS -o /dev/null --max-time 10 "$CFG_HEALTH_URL" >>"$BUILDLOG" 2>&1; then
+      return 0
+    fi
+    i=$((i + 1))
+    [ "$i" -lt "$CFG_HEALTH_RETRIES" ] || return 1
+    sleep "$CFG_HEALTH_INTERVAL"
+  done
+}
+
+last_error() {
+  grep -v '^[[:space:]]*$' "$BUILDLOG" 2>/dev/null | tail -n 1 | cut -c1-160
+}
+
+# ---------------------------------------------------------------- commands
+
+deploy() { # [ref]
+  local ref=${1:-$CFG_BRANCH} live idle sha="" live_sha start stage="" kept
+  check_current_is_link
+  mkdir -p "$SLOTS" "$STATE" "$(dirname "$BUILDLOG")"
+  acquire_lock || return 0
+  live=$(live_slot)
+  if [ "$live" = a ]; then idle=b; else idle=a; fi
+  live_sha=""
+  [ -z "$live" ] || live_sha=$(slot_sha "$live")
+  start=$(date +%s)
+  : >"$BUILDLOG"
+
+  if ! sha=$(prepare_slot "$idle" "$ref"); then
+    stage=fetch
+  elif [ -n "$CFG_INSTALL_CMD" ] && ! run_step "$idle" "$sha" "$CFG_INSTALL_CMD"; then
+    stage=install
+  elif [ -n "$CFG_BUILD_CMD" ] && ! run_step "$idle" "$sha" "$CFG_BUILD_CMD"; then
+    stage=build
+  elif [ -n "$CFG_CHECK_CMD" ] && ! run_step "$idle" "$sha" "$CFG_CHECK_CMD"; then
+    stage=check
+  else
+    point_current "$idle"
+    if [ -n "$CFG_RESTART_CMD" ] && ! run_step "$idle" "$sha" "$CFG_RESTART_CMD"; then
+      stage=restart
+    elif ! healthy; then
+      stage=health
+    fi
+    if [ -n "$stage" ]; then
+      # The new build is live but broken: put the previous one back.
+      point_current "$live"
+      if [ -n "$live" ] && [ -n "$CFG_RESTART_CMD" ]; then
+        run_step "$live" "$live_sha" "$CFG_RESTART_CMD" || true
+      fi
+    fi
+  fi
+
+  if [ -n "$stage" ]; then
+    [ -n "$sha" ] || sha=$ref
+    printf '%s\n' "$sha" >"$STATE/failed"
+    cp "$BUILDLOG" "$(dirname "$BUILDLOG")/last-failed.log"
+    if [ -n "$live" ]; then kept="kept ${live_sha:0:7} (slot=$live)"; else kept="nothing was live"; fi
+    logline "FAIL $CFG_BRANCH ${sha:0:7} $stage failed, $kept | $(last_error)"
+    release_lock
+    return 1
+  fi
+
+  rm -f "$STATE/failed"
+  logline "OK   $CFG_BRANCH ${sha:0:7} slot=$idle $(($(date +%s) - start))s | $(git -C "$SLOTS/$idle" log -1 --format=%s | cut -c1-80)"
+  release_lock
+}
+
+watch_once() {
+  local remote_sha live failed
+  check_current_is_link
+  remote_sha=$(git ls-remote "$CFG_REPO_URL" "refs/heads/$CFG_BRANCH" |
+    awk -v r="refs/heads/$CFG_BRANCH" '$2 == r { print $1 }') || {
+    echo "$PROG: cannot reach $CFG_REPO_URL" >&2
+    return 1
+  }
+  if [ -z "$remote_sha" ]; then
+    echo "$PROG: branch '$CFG_BRANCH' does not exist on the remote yet" >&2
+    return 0
+  fi
+  live=$(live_slot)
+  [ -z "$live" ] || [ "$(slot_sha "$live")" != "$remote_sha" ] || return 0
+  failed=$(cat "$STATE/failed" 2>/dev/null || true)
+  [ "$remote_sha" != "$failed" ] || return 0
+  deploy "$remote_sha"
+}
+
+status() {
+  local live sha failed
+  live=$(live_slot)
+  if [ -n "$live" ]; then
+    sha=$(slot_sha "$live")
+    printf 'live:    slot %s, %s %s\n' "$live" "${sha:0:7}" "$(git -C "$SLOTS/$live" log -1 --format='"%s" (%cr)')"
+  else
+    printf 'live:    nothing deployed yet\n'
+  fi
+  printf 'branch:  %s\n' "$CFG_BRANCH"
+  failed=$(cat "$STATE/failed" 2>/dev/null || true)
+  [ -z "$failed" ] || printf 'failed:  %s (log: %s)\n' "${failed:0:7}" "$(dirname "$BUILDLOG")/last-failed.log"
+  if [ -f "$LOGFILE" ]; then
+    printf 'recent:\n'
+    tail -n 5 "$LOGFILE" | sed 's/^/  /'
+  fi
+}
+
+main() {
+  local config="${SLOTDEPLOY_CONFIG:-./slotdeploy.env}" cmd every
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -c | --config) [ $# -ge 2 ] || die "-c needs a path"; config=$2; shift 2 ;;
+      -h | --help) usage; return 0 ;;
+      *) break ;;
+    esac
+  done
+  cmd=${1:-}
+  [ $# -eq 0 ] || shift
+  case $cmd in
+    version | --version) echo "$PROG $VERSION"; return 0 ;;
+    '' | help) usage; return 0 ;;
+  esac
+  load_config "$config"
+  case $cmd in
+    watch)
+      if [ "${1:-}" = "--every" ]; then
+        every=${2:-}
+        case $every in '' | *[!0-9]* | 0) die "--every needs a positive number of seconds" ;; esac
+        while :; do
+          watch_once || true
+          sleep "$every"
+        done
+      fi
+      watch_once ;;
+    deploy) deploy "${1:-}" ;;
+    status) status ;;
+    *) usage >&2; return 2 ;;
+  esac
+}
+
+main "$@"

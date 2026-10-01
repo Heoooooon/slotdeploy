@@ -1,0 +1,11 @@
+# Install: sudo cp slotdeploy-watch.* /etc/systemd/system/ && sudo systemctl enable --now slotdeploy-watch.timer
+[Unit]
+Description=slotdeploy: check the preview branch every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Unit=slotdeploy-watch.service
+
+[Install]
+WantedBy=timers.target

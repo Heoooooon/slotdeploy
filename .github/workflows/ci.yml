@@ -1,0 +1,17 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck bin/slotdeploy bin/slotdeploy-push test/run.sh demo/sandbox.sh
+      - name: tests (real bare git remote, fake builds)
+        run: bash test/run.sh
