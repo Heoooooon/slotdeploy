@@ -1,51 +1,51 @@
+**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
+
 # slotdeploy
 
-**개발자가 아닌 사람도 "preview로 올려줘" 한 마디로, 미리보기 서버를 망가뜨릴 걱정 없이.**
+**Let non-developers say "put it on preview" — without ever breaking the preview server.**
 
-[English](README.en.md)
+Designers, marketers, and ops teammates ship their edits to a preview server through an AI agent (or a single terminal command).
+If a change fails to build or the server doesn't come back up, **the preview server keeps serving the previous version.**
+The production (`main`) branch is never touched. Releasing to production stays a human decision, made after review.
 
-디자이너·마케터·운영 담당 동료가 AI 에이전트(또는 터미널 한 줄)로 수정한 내용을 미리보기 서버에 올립니다.
-올린 수정이 빌드에 실패하거나 서버가 제대로 뜨지 않으면, **미리보기 서버는 이전 화면을 그대로 유지**합니다.
-운영(main) 브랜치는 건드리지 않습니다. 운영 반영은 사람이 확인한 뒤에 합니다.
+![slotdeploy demo: a good change goes live, a broken build is rejected and the previous page stays up](demo/demo.gif)
 
-![demo](demo/demo.gif)
+- Two bash scripts (`bin/slotdeploy`, `bin/slotdeploy-push`). All you need is `bash`, `git`, and `curl`.
+- The server checks the `preview` branch every minute from a systemd timer (Linux) or launchd (macOS).
+- Works with the stock macOS bash 3.2.
 
-- bash 스크립트 두 개(`bin/slotdeploy`, `bin/slotdeploy-push`). 필요한 건 `bash`, `git`, `curl`뿐입니다.
-- 서버는 systemd 타이머(리눅스)나 launchd(macOS)로 1분마다 `preview` 브랜치를 확인합니다.
-- macOS 기본 bash 3.2에서도 동작합니다.
-
-## 어떻게 안전한가
+## Why it's safe
 
 ```
-동료 PC                                   미리보기 서버
-slotdeploy-push push "배너 수정"           slotdeploy watch  (1분마다)
-  1. 작업 브랜치(work/...)에 커밋             1. preview가 바뀌었나?
-  2. 작업 브랜치 백업 push                    2. 쉬고 있는 슬롯(a 또는 b)에서 install → build → check
-  3. preview 브랜치를 그 커밋으로             3. 통과하면 current 링크를 원자적으로 교체 → 재시작
-     (main은 절대 push하지 않음)              4. 헬스체크 실패면 링크를 즉시 이전 슬롯으로 되돌림
-                                            5. 결과를 한 줄 로그로
+Teammate's machine                         Preview server
+slotdeploy-push push "new banner"          slotdeploy watch  (every minute)
+  1. commit on a work branch (work/...)      1. has preview moved?
+  2. push the work branch as a backup        2. install -> build -> check in the idle slot (a or b)
+  3. point preview at that commit            3. on success: swap the current symlink atomically -> restart
+     (never pushes main)                     4. health check fails: swap straight back to the previous slot
+                                             5. log the result as one line
 ```
 
-| 상황 | 결과 |
+| Situation | Result |
 |---|---|
-| 빌드 실패 (타입 오류 등) | 링크 교체 안 함. 이전 빌드가 계속 서비스됨. `FAIL ... build failed, kept 1a2b3c4` |
-| 빌드는 됐는데 서버가 안 뜸 | 이전 슬롯으로 링크 복구 + 재시작. `FAIL ... health failed, kept ...` |
-| 같은 실패 커밋 | 1분마다 다시 빌드하지 않음. 새 커밋이 오면 다시 시도 |
-| 두 배포가 겹침 | 잠금으로 하나만 실행. 죽은 프로세스가 남긴 잠금은 자동 정리 |
-| 되돌리고 싶음 | `slotdeploy-push rollback 이전` / `어제` / `<커밋>` — preview만 옮기고 내 파일은 그대로 |
+| Build fails (type error, etc.) | No switch. The previous build keeps serving. `FAIL ... build failed, kept 1a2b3c4` |
+| Build passes but the app doesn't come up | Symlink restored to the previous slot, app restarted. `FAIL ... health failed, kept ...` |
+| Same failing commit | Not rebuilt every minute. A new commit triggers a fresh attempt |
+| Two deploys overlap | A lock lets only one run. Stale locks left by dead processes are cleaned up automatically |
+| You want to undo | `slotdeploy-push rollback prev` / `yesterday` / `<commit>` — moves preview only; your local files stay as they are |
 
-클라이언트는 `main` push, `git reset`, `git stash`를 쓰지 않습니다. main 위에서 수정했더라도 변경 사항을 새 작업 브랜치로 옮겨서 올립니다.
+The client never pushes `main` and never runs `git reset` or `git stash`. If you edited on top of `main`, your changes are carried over to a new work branch before anything is pushed.
 
-## 설치
+## Install
 
 ```bash
 git clone https://github.com/Heoooooon/slotdeploy.git
 sudo install -m 755 slotdeploy/bin/slotdeploy slotdeploy/bin/slotdeploy-push /usr/local/bin/
 ```
 
-## 서버 설정
+## Server setup
 
-1. 설정 파일 작성 — 예시: [Next.js](examples/nextjs/slotdeploy.env), [정적 사이트](examples/static/slotdeploy.env)
+1. Write a config file — examples: [Next.js](examples/nextjs/slotdeploy.env), [static site](examples/static/slotdeploy.env)
 
    ```ini
    REPO_URL=git@github.com:example/myapp.git
@@ -53,88 +53,88 @@ sudo install -m 755 slotdeploy/bin/slotdeploy slotdeploy/bin/slotdeploy-push /us
    ROOT=/srv/myapp
    INSTALL_CMD=npm ci
    BUILD_CMD=npm run build
-   CHECK_CMD=test -f .next/BUILD_ID          # 전환 전에 통과해야 함
+   CHECK_CMD=test -f .next/BUILD_ID          # must pass before switching
    RESTART_CMD=sudo systemctl restart myapp
-   HEALTH_URL=http://127.0.0.1:3000/          # 전환 후 확인, 실패하면 되돌림
+   HEALTH_URL=http://127.0.0.1:3000/          # checked after switching; on failure, switch back
    ```
 
-   | 키 | 설명 | 기본값 |
+   | Key | Meaning | Default |
    |---|---|---|
-   | `REPO_URL` | git 원격 주소 | (필수) |
-   | `BRANCH` | 감시할 브랜치 | `preview` |
-   | `ROOT` | 작업 폴더. `ROOT/slots/a`, `ROOT/slots/b`, `ROOT/current`(링크) | (필수) |
-   | `INSTALL_CMD`, `BUILD_CMD` | 쉬는 슬롯 안에서 실행 | 없음 |
-   | `CHECK_CMD` | 전환 **전** 검사. 실패하면 서비스는 손대지 않음 | 없음 |
-   | `RESTART_CMD` | 전환 후 실행 | 없음 |
-   | `HEALTH_URL` | 전환 **후** `curl -f` 확인. 실패하면 이전 슬롯으로 복구 | 없음 |
-   | `HEALTH_RETRIES`, `HEALTH_INTERVAL` | 헬스체크 횟수 / 간격(초) | `30`, `2` |
-   | `SHARED_DIR` | git에 없는 파일(.env 등)을 슬롯마다 복사 | 없음 |
-   | `KEEP` | 같은 슬롯 재빌드 때 지우지 않을 경로 | `node_modules` |
+   | `REPO_URL` | git remote URL | (required) |
+   | `BRANCH` | branch to watch | `preview` |
+   | `ROOT` | working directory: `ROOT/slots/a`, `ROOT/slots/b`, `ROOT/current` (symlink) | (required) |
+   | `INSTALL_CMD`, `BUILD_CMD` | run inside the idle slot | none |
+   | `CHECK_CMD` | check **before** switching; on failure the running service is left untouched | none |
+   | `RESTART_CMD` | run after switching | none |
+   | `HEALTH_URL` | `curl -f` **after** switching; on failure the previous slot is restored | none |
+   | `HEALTH_RETRIES`, `HEALTH_INTERVAL` | number of health checks / seconds between them | `30`, `2` |
+   | `SHARED_DIR` | files that aren't in git (`.env`, etc.), copied into every slot | none |
+   | `KEEP` | paths not deleted when a slot is rebuilt | `node_modules` |
 
-   설정 값은 불러올 때 셸로 실행되지 않습니다(명령 키만 해당 단계에서 `bash -c`로 실행). 모르는 키는 오류로 거부합니다.
+   Config values are never evaluated by the shell when the file is loaded (only command keys run, via `bash -c`, at their step). Unknown keys are rejected with an error.
 
-2. 앱 서비스가 `ROOT/current`에서 실행되게 합니다 — [myapp.service](examples/nextjs/myapp.service), [nginx.conf](examples/static/nginx.conf).
-   기존 폴더가 `ROOT/current`에 있다면 먼저 옮기세요(실제 폴더면 slotdeploy가 거부합니다).
-3. 타이머 등록 — [systemd](examples/systemd/), [launchd](examples/launchd/com.example.slotdeploy.plist)
+2. Make your app service run from `ROOT/current` — [myapp.service](examples/nextjs/myapp.service), [nginx.conf](examples/static/nginx.conf).
+   If `ROOT/current` is already a real directory, move it out of the way first (slotdeploy refuses to replace it).
+3. Register the timer — [systemd](examples/systemd/), [launchd](examples/launchd/com.example.slotdeploy.plist)
 
    ```bash
-   slotdeploy -c /srv/myapp/slotdeploy.env deploy   # 첫 배포를 직접
+   slotdeploy -c /srv/myapp/slotdeploy.env deploy   # run the first deploy by hand
    slotdeploy -c /srv/myapp/slotdeploy.env status
    tail -f /srv/myapp/slotdeploy.log
    ```
 
-로그 예:
+Example log:
 
 ```
 2026-05-04 10:12:31 OK   preview 3f9c1d2 slot=b 58s | Update opening hours
 2026-05-04 10:27:05 FAIL preview 8e41a7b build failed, kept 3f9c1d2 (slot=b) | Type error: Property 'title' does not exist
 ```
 
-실패한 빌드의 전체 출력은 `ROOT/logs/last-failed.log`에 남습니다.
+The full output of the last failed build is kept in `ROOT/logs/last-failed.log`.
 
-## 동료 PC (클라이언트)
+## Teammate's machine (client)
 
 ```bash
-slotdeploy-push start                   # 수정 시작 전: 지금 preview 상태에서 새 작업 브랜치
-# ... 파일 수정 ...
-slotdeploy-push push "배너 문구 수정"     # 커밋 → 작업 브랜치 백업 → preview로 올리기
-slotdeploy-push status                  # 지금 preview에 뭐가 올라가 있나
-slotdeploy-push rollback 이전            # 방금 전으로 (prev)
-slotdeploy-push rollback 어제            # 오늘 0시 이전 마지막 상태로 (yesterday)
-slotdeploy-push rollback 1a2b3c4        # 특정 커밋으로
+slotdeploy-push start                    # before editing: new work branch from the current preview
+# ... edit files ...
+slotdeploy-push push "Fix banner text"   # commit -> back up the work branch -> update preview
+slotdeploy-push status                   # what's on preview right now
+slotdeploy-push rollback prev            # back to the previous one (alias: 이전)
+slotdeploy-push rollback yesterday       # last state before 00:00 today (alias: 어제)
+slotdeploy-push rollback 1a2b3c4         # a specific commit
 ```
 
-설정은 환경 변수나 `git config`로: `slotdeploy.remote`(origin), `slotdeploy.branch`(preview), `slotdeploy.prefix`(work/), `slotdeploy.protected`("main master").
+Configure with environment variables or `git config`: `slotdeploy.remote` (origin), `slotdeploy.branch` (preview), `slotdeploy.prefix` (work/), `slotdeploy.protected` ("main master").
 
-## AI 에이전트에 붙이기
+## Use it with an AI agent
 
-[examples/agent-skill/SKILL.md](examples/agent-skill/SKILL.md)를 에이전트의 스킬 폴더에 넣으면
-"preview로 올려줘", "어제 상태로 돌려줘" 같은 말에 위 명령을 실행합니다.
-에이전트는 운영 배포를 하지 않고, 운영 반영은 사람에게 확인을 요청하도록 적혀 있습니다.
+Drop [examples/agent-skill/SKILL.md](examples/agent-skill/SKILL.md) into your agent's skills folder, and it will run the commands above
+when someone says "put it on preview" or "roll the preview back to yesterday".
+The skill tells the agent never to deploy to production and to ask a person before anything is released.
 
-## 직접 해보기 (로컬, 서버 없이)
+## Try it locally (no server needed)
 
 ```bash
-source demo/sandbox.sh      # /tmp/slotdeploy-demo 에 원격·서버·동료 PC를 만듭니다
+source demo/sandbox.sh      # sets up a remote, a server, and a teammate's clone in /tmp/slotdeploy-demo
 edit_page "Hello"; slotdeploy-push push "hello"; slotdeploy watch; site
-break_build; slotdeploy-push push "broken"; slotdeploy watch; site   # 이전 화면 유지
+break_build; slotdeploy-push push "broken"; slotdeploy watch; site   # the previous page stays up
 ```
 
-## 테스트
+## Tests
 
 ```bash
-bash test/run.sh            # 실제 bare git 원격 + 성공/실패하는 가짜 빌드
+bash test/run.sh            # a real bare git remote + fake builds that pass or fail
 shellcheck bin/* test/run.sh demo/sandbox.sh
 ```
 
-검증하는 것: 빌드 실패·헬스 실패·검사 실패 시 이전 유지, 같은 실패 커밋 재시도 안 함, 잠금, 롤백(이전/어제/커밋) 시 작업 파일 불변, 원격 main 불변, 보호 브랜치 거부, 설정 값 비실행.
+What's covered: the previous build is kept on build, health, or check failure; a failed commit isn't retried; locking; rollback (prev / yesterday / commit) leaves local files untouched; the remote `main` is never changed; protected branches are refused; config values are never executed.
 
-## 하지 않는 것
+## Non-goals
 
-- 운영 배포. slotdeploy는 미리보기 서버용입니다.
-- 무중단 보장. 재시작하는 동안 짧은 끊김이 있을 수 있습니다(정적 사이트는 링크 교체만이라 끊김 없음).
-- 빌드 시간 제한. 필요하면 `BUILD_CMD=timeout 600 npm run build`처럼 감싸세요.
+- Production deploys. slotdeploy is built for preview servers.
+- Zero downtime. Requests may drop briefly while the app restarts (static sites only swap a symlink, so there's no gap).
+- Build timeouts. Wrap the command if you need one: `BUILD_CMD=timeout 600 npm run build`.
 
-## 라이선스
+## License
 
 MIT
