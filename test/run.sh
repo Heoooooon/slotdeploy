@@ -159,14 +159,16 @@ test_watch_is_quiet_when_up_to_date() {
 
 test_live_lock_skips_and_stale_lock_recovers() {
   mkdir -p "$SRV/.lock"
-  sleep 30 &
-  holder=$!
+  holder=$$
   echo "$holder" >"$SRV/.lock/pid"
   sd watch >/dev/null 2>"$T/err"
   assert_grep "$T/err" "another deploy is running"
   [ ! -e "$SRV/current" ] || fail "deployed while locked"
-  kill "$holder"
-  wait "$holder" 2>/dev/null || true
+  # A reaped child has a stale pid without timing-dependent sleeps.
+  bash -c ':' &
+  holder=$!
+  wait "$holder"
+  echo "$holder" >"$SRV/.lock/pid"
   sd watch >/dev/null
   assert_eq "$(served)" "v1" "deploy after stale lock"
   [ ! -e "$SRV/.lock" ] || fail "lock left behind"
@@ -326,3 +328,10 @@ done
 rm -f "${TMPDIR:-/tmp}/slotdeploy-test-out.$$"
 printf '\n%d passed, %d failed\n' "$pass" "$failed"
 [ "$failed" -eq 0 ] || { printf 'failed:%s\n' "$failures"; exit 1; }
+
+# Feature suites also run when no legacy name filter was supplied.
+if [ -z "$FILTER" ]; then
+  bash "$HERE/install.sh"
+  bash "$HERE/init.sh"
+  bash "$HERE/notifications.sh"
+fi

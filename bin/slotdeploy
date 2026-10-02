@@ -6,7 +6,7 @@
 # A failed commit never replaces the build that is currently live.
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROG="slotdeploy"
 
 usage() {
@@ -14,6 +14,7 @@ usage() {
 Usage: slotdeploy [-c CONFIG] <command>
 
 Commands:
+  init [OPTIONS]           Generate config and systemd/launchd timer interactively
   watch [--every SECONDS]  Deploy if the watched branch moved (one check, or loop)
   deploy [REF]             Build REF (default: tip of the watched branch) now
   status                   Show the live slot, commit and recent log lines
@@ -101,6 +102,51 @@ logline() {
 
 LOCK_HELD=""
 
+# Notifications are opt-in environment settings, never config/log values.
+# Send structured deployment facts only, not untrusted build output/subjects.
+json_string() {
+  local value=$1 char out="" i
+  for ((i=0; i<${#value}; i++)); do
+    char=${value:i:1}
+    case $char in
+      '"') out="$out\\\"" ;; \\) out="$out\\\\" ;;
+      $'\n') out="$out\\n" ;; $'\r') out="$out\\r" ;;
+      $'\t') out="$out\\t" ;; $'\b') out="$out\\b" ;;
+      $'\f') out="$out\\f" ;;
+      [[:cntrl:]]) printf -v char '\\u%04x' "'$char"; out="$out$char" ;;
+      *) out="$out$char" ;;
+    esac
+  done
+  printf '"%s"' "$out"
+}
+
+notify() { # event sha slot stage
+  local event=$1 sha=$2 slot=$3 stage=$4 text payload provider url
+  text="slotdeploy $event branch=$CFG_BRANCH sha=${sha:0:7} slot=${slot:-none} stage=${stage:-complete}"
+  for provider in telegram discord slack; do
+    url=""
+    case $provider in
+      telegram)
+        url=${SLOTDEPLOY_TELEGRAM_URL:-}
+        [ -z "$url" ] || [ -n "${SLOTDEPLOY_TELEGRAM_CHAT_ID:-}" ] || continue
+        payload="{\"chat_id\":$(json_string "${SLOTDEPLOY_TELEGRAM_CHAT_ID:-}"),\"text\":$(json_string "$text")}" ;;
+      discord)
+        url=${SLOTDEPLOY_DISCORD_URL:-}
+        payload="{\"content\":$(json_string "$text")}" ;;
+      slack)
+        url=${SLOTDEPLOY_SLACK_URL:-}
+        payload="{\"text\":$(json_string "$text")}" ;;
+    esac
+    [ -n "$url" ] || continue
+    # No URL, response body or curl diagnostics reach deploy output/logs.
+    if ! curl -q -fsS --connect-timeout 3 --max-time 5 \
+      -H 'Content-Type: application/json' --data-binary "$payload" \
+      --output /dev/null --url "$url" >/dev/null 2>&1; then
+      printf 'slotdeploy: %s notification delivery failed\n' "$provider" >&2
+    fi
+  done
+}
+
 acquire_lock() {
   local pid
   if mkdir "$LOCKDIR" 2>/dev/null; then
@@ -159,6 +205,9 @@ point_current() {
 run_step() { # slot sha command
   (
     cd "$SLOTS/$1"
+    # Build commands do not need the notifier's credentials.
+    unset SLOTDEPLOY_TELEGRAM_URL SLOTDEPLOY_TELEGRAM_CHAT_ID \
+      SLOTDEPLOY_DISCORD_URL SLOTDEPLOY_SLACK_URL
     SLOTDEPLOY_SLOT=$1 SLOTDEPLOY_SHA=$2 SLOTDEPLOY_ROOT=$CFG_ROOT bash -c "$3"
   ) </dev/null >>"$BUILDLOG" 2>&1
 }
@@ -209,7 +258,7 @@ last_error() {
 # ---------------------------------------------------------------- commands
 
 deploy() { # [ref]
-  local ref=${1:-$CFG_BRANCH} live idle sha="" live_sha start stage="" kept
+  local ref=${1:-$CFG_BRANCH} live idle sha="" live_sha start stage="" kept rolled_back=""
   check_current_is_link
   mkdir -p "$SLOTS" "$STATE" "$(dirname "$BUILDLOG")"
   acquire_lock || return 0
@@ -238,6 +287,7 @@ deploy() { # [ref]
     if [ -n "$stage" ]; then
       # The new build is live but broken: put the previous one back.
       point_current "$live"
+      [ -z "$live" ] || rolled_back=1
       if [ -n "$live" ] && [ -n "$CFG_RESTART_CMD" ]; then
         run_step "$live" "$live_sha" "$CFG_RESTART_CMD" || true
       fi
@@ -251,12 +301,15 @@ deploy() { # [ref]
     if [ -n "$live" ]; then kept="kept ${live_sha:0:7} (slot=$live)"; else kept="nothing was live"; fi
     logline "FAIL $CFG_BRANCH ${sha:0:7} $stage failed, $kept | $(last_error)"
     release_lock
+    notify failure "$sha" "$idle" "$stage"
+    [ -z "$rolled_back" ] || notify rollback "$live_sha" "$live" "$stage"
     return 1
   fi
 
   rm -f "$STATE/failed"
   logline "OK   $CFG_BRANCH ${sha:0:7} slot=$idle $(($(date +%s) - start))s | $(git -C "$SLOTS/$idle" log -1 --format=%s | cut -c1-80)"
   release_lock
+  notify success "$sha" "$idle" ""
 }
 
 watch_once() {
@@ -310,6 +363,9 @@ main() {
   case $cmd in
     version | --version) echo "$PROG $VERSION"; return 0 ;;
     '' | help) usage; return 0 ;;
+    init)
+      bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/slotdeploy-init" --config "$config" "$@"
+      return ;;
   esac
   load_config "$config"
   case $cmd in

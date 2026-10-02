@@ -10,7 +10,7 @@
 
 ![slotdeploy のデモ：正常な修正は反映され、壊れたビルドは拒否されて直前の画面が維持される](demo/demo.gif)
 
-- bash スクリプト 2 本（`bin/slotdeploy`、`bin/slotdeploy-push`）だけ。必要なのは `bash`、`git`、`curl` のみです。
+- Bash コマンド（`bin/slotdeploy`、`bin/slotdeploy-push`）と初期設定ヘルパー。実行に必要なのは `bash`、`git`、`curl` です。
 - サーバーは systemd タイマー（Linux）または launchd（macOS）で 1 分ごとに `preview` ブランチを確認します。
 - macOS 標準の bash 3.2 でも動作します。
 
@@ -40,8 +40,46 @@ slotdeploy-push push "バナー修正"          slotdeploy watch  (1 分ごと)
 
 ```bash
 git clone https://github.com/Heoooooon/slotdeploy.git
-sudo install -m 755 slotdeploy/bin/slotdeploy slotdeploy/bin/slotdeploy-push /usr/local/bin/
+sh slotdeploy/install.sh --source slotdeploy
 ```
+
+1 行でインストール（既定は `~/.local/bin`、sudo 不要）:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Heoooooon/slotdeploy/main/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://raw.githubusercontent.com/Heoooooon/slotdeploy/main/install.sh | sh -s -- update
+curl -fsSL https://raw.githubusercontent.com/Heoooooon/slotdeploy/main/install.sh | sh -s -- uninstall
+```
+
+`--bin-dir` で保存先、`--ref <branch/tag/commit>` でバージョンを選びます。既定は `main`。削除時も設定・タイマー・デプロイ済みサイトは保持します。
+
+## 初期設定 (v0.2.0)
+
+`slotdeploy init` はリポジトリ、保存先、ブランチ、ビルド・再起動コマンド、ヘルス URL、タイマーを質問します。非対話型:
+
+```bash
+slotdeploy -c "$HOME/site/slotdeploy.env" init --yes \
+  --repo git@github.com:example/site.git --root "$HOME/site" \
+  --install 'npm ci' --build 'npm run build' \
+  --health-url http://127.0.0.1:3000/ --timer systemd
+```
+
+設定は権限 600 で作成し、既存ファイルは上書きしません。`--timer systemd` は `~/.config/systemd/user`、`--timer launchd` は `~/Library/LaunchAgents` に出力。`--timer none` は設定のみ。`--timer-dir`、`--every 60`、`--name`、`--check` も指定できます。**生成だけで有効化はしません**。表示された有効化コマンドを実行し、初回は手動でデプロイしてください。ログアウト後も systemd を動かすには `loginctl enable-linger "$USER"` が必要です。launchd ユーザーエージェントはログイン中に動きます。
+
+## 通知
+
+Git や設定ファイルではなく、**watcher の環境変数**で指定します。
+
+| サービス | 環境変数 |
+|---|---|
+| Telegram | `SLOTDEPLOY_TELEGRAM_URL` (完全な `/sendMessage` URL)、`SLOTDEPLOY_TELEGRAM_CHAT_ID` |
+| Discord | `SLOTDEPLOY_DISCORD_URL` |
+| Slack | `SLOTDEPLOY_SLACK_URL` |
+
+`success`、`failure`、再起動・ヘルス失敗で以前の稼働スロットを復元した場合は追加で `rollback` を送信します。クライアントの rollback はブランチを移動し、watcher がその後のデプロイ結果を通知します。通知エラーはデプロイ結果を変えません。タイムアウトを設定し、ブランチ・コミット・スロット・失敗段階だけを送信します。秘密 URL・チャット ID・応答はログに出さず、ビルドプロセスにも通知の認証情報を渡しません。
+
+systemd は非公開の `EnvironmentFile=` をサービスの drop-in で指定、launchd は非公開の `EnvironmentVariables` またはロード前の `launchctl setenv` を使います。環境を変更したら watcher を再ロード。秘密を共有ログに貼ったりシェルトレースを有効にしたりしないでください。
 
 ## サーバーの設定
 
@@ -112,6 +150,16 @@ slotdeploy-push rollback 1a2b3c4         # 特定のコミットに戻す
 「preview に上げて」「昨日の状態に戻して」といった指示で上のコマンドを実行します。
 スキルには、エージェントは本番デプロイを行わず、本番への反映は人に確認を求めるよう書かれています。
 
+クローンしたリポジトリからパッケージを配置:
+
+```bash
+mkdir -p "$HOME/.omo/agent/skills" "$HOME/.claude/skills"
+cp -R skills/omo/preview-deploy "$HOME/.omo/agent/skills/"
+cp -R skills/claude-code/preview-deploy "$HOME/.claude/skills/"
+```
+
+スキルを再ロード後、**「preview に上げて」** / **"preview로 올려줘"**。push 成功とサーバーの稼働確認を区別し、未確認の URL は作りません。
+
 ## ローカルで試す（サーバー不要）
 
 ```bash
@@ -124,9 +172,10 @@ break_build; slotdeploy-push push "broken"; slotdeploy watch; site   # 直前の
 
 ```bash
 bash test/run.sh            # 本物の bare git リモート + 成功／失敗する偽のビルド
-shellcheck bin/* test/run.sh demo/sandbox.sh
+shellcheck bin/* install.sh test/*.sh demo/sandbox.sh
 ```
 
+テストには Python 3.12 以上も必要です（ローカル HTTP 通知と plist 検証）。実行バイナリは Bash・Git・curl のみ必要です。
 検証している内容：ビルド・ヘルスチェック・事前チェックの失敗時に直前の版を維持、同じ失敗コミットを再試行しない、ロック、ロールバック（prev / yesterday / コミット）で作業ファイルが変わらない、リモートの `main` が変わらない、保護ブランチの拒否、設定値を実行しない。
 
 ## やらないこと

@@ -2,7 +2,7 @@
 # Source this file to get a local playground: a bare git remote, a "server"
 # directory driven by slotdeploy, and a teammate's clone driven by slotdeploy-push.
 #   source demo/sandbox.sh
-# Nothing leaves your machine; everything lives under $DEMO.
+# Nothing leaves your machine; all demo state lives under $DEMO.
 
 DEMO=${DEMO:-/tmp/slotdeploy-demo}
 SLOTDEPLOY_HOME=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
