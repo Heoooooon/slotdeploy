@@ -10,7 +10,7 @@ The production (`main`) branch is never touched. Releasing to production stays a
 
 ![slotdeploy demo: a good change goes live, a broken build is rejected and the previous page stays up](demo/demo.gif)
 
-- Two bash scripts (`bin/slotdeploy`, `bin/slotdeploy-push`). All you need is `bash`, `git`, and `curl`.
+- Bash commands (`bin/slotdeploy`, `bin/slotdeploy-push`) and the init helper. Runtime requirements: `bash`, `git`, and `curl`.
 - The server checks the `preview` branch every minute from a systemd timer (Linux) or launchd (macOS).
 - Works with the stock macOS bash 3.2.
 
@@ -40,8 +40,47 @@ The client never pushes `main` and never runs `git reset` or `git stash`. If you
 
 ```bash
 git clone https://github.com/Heoooooon/slotdeploy.git
-sudo install -m 755 slotdeploy/bin/slotdeploy slotdeploy/bin/slotdeploy-push /usr/local/bin/
+sh slotdeploy/install.sh --source slotdeploy
 ```
+
+Or install in one line (default `~/.local/bin`, no sudo):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Heoooooon/slotdeploy/main/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+# Update / remove binaries; config, timers and deployed sites are kept.
+curl -fsSL https://raw.githubusercontent.com/Heoooooon/slotdeploy/main/install.sh | sh -s -- update
+curl -fsSL https://raw.githubusercontent.com/Heoooooon/slotdeploy/main/install.sh | sh -s -- uninstall
+```
+
+Use `--bin-dir /usr/local/bin` with appropriate permissions, or `--ref <branch/tag/commit>` to select a version. The default tracks `main`; no release tag is required.
+
+## Quick setup (v0.2.0)
+
+`slotdeploy init` asks for the repository, deployment directory, branch, build/restart commands, health URL and scheduler. Unattended setup:
+
+```bash
+slotdeploy -c "$HOME/site/slotdeploy.env" init --yes \
+  --repo git@github.com:example/site.git --root "$HOME/site" \
+  --build 'npm run build' --install 'npm ci' \
+  --health-url http://127.0.0.1:3000/ --timer systemd
+```
+
+The config is private (mode 600), and existing files are never overwritten. `--timer systemd` writes user units in `~/.config/systemd/user`; `--timer launchd` writes a plist in `~/Library/LaunchAgents`; `--timer none` writes only config. `--timer-dir`, `--every 60`, `--name` and `--check` customize setup. Timers are **generated, not activated**: init prints the activation command. Run the first deploy manually; user systemd timers need `loginctl enable-linger "$USER"` to continue after logout. macOS launch agents run while the user is logged in.
+
+## Notifications
+
+Set these variables in the **watcher's environment**, not `slotdeploy.env` or Git:
+
+| Provider | Environment variables |
+|---|---|
+| Telegram | `SLOTDEPLOY_TELEGRAM_URL` (full bot `/sendMessage` URL), `SLOTDEPLOY_TELEGRAM_CHAT_ID` |
+| Discord | `SLOTDEPLOY_DISCORD_URL` (webhook URL) |
+| Slack | `SLOTDEPLOY_SLACK_URL` (incoming webhook URL) |
+
+The watcher sends `success`, `failure`, and an additional `rollback` when it restores a previous live slot after restart/health failure. Client `slotdeploy-push rollback` moves the branch; the watcher reports the resulting deployment, not a separate client notification. A rejected notification never changes the deployment result. Requests have bounded timeouts; only structured branch/commit/slot/stage facts are sent. URL/chat secrets and provider responses are not logged, and notification credentials are not passed to build commands.
+
+For a generated systemd service, use a private `EnvironmentFile=` in a service drop-in; for launchd, configure `EnvironmentVariables` privately or use `launchctl setenv` before loading the agent. Restart/reload the watcher after changing its environment. Never paste real tokens into shared logs or enable shell tracing with secrets.
 
 ## Server setup
 
@@ -112,6 +151,16 @@ Drop [examples/agent-skill/SKILL.md](examples/agent-skill/SKILL.md) into your ag
 when someone says "put it on preview" or "roll the preview back to yesterday".
 The skill tells the agent never to deploy to production and to ask a person before anything is released.
 
+From a cloned checkout, install the packaged skill for either agent:
+
+```bash
+mkdir -p "$HOME/.omo/agent/skills" "$HOME/.claude/skills"
+cp -R skills/omo/preview-deploy "$HOME/.omo/agent/skills/"
+cp -R skills/claude-code/preview-deploy "$HOME/.claude/skills/"
+```
+
+Example: **"preview로 올려줘"** or **"put it on preview"**. Reload skills/restart the agent after installation. The skill reports the pushed commit and distinguishes it from verified server health; it never invents a preview URL.
+
 ## Try it locally (no server needed)
 
 ```bash
@@ -124,9 +173,10 @@ break_build; slotdeploy-push push "broken"; slotdeploy watch; site   # the previ
 
 ```bash
 bash test/run.sh            # a real bare git remote + fake builds that pass or fail
-shellcheck bin/* test/run.sh demo/sandbox.sh
+shellcheck bin/* install.sh test/*.sh demo/sandbox.sh
 ```
 
+Tests additionally require Python 3.12+ for local HTTP notification and plist validation; the runtime binaries still need only Bash, Git and curl.
 What's covered: the previous build is kept on build, health, or check failure; a failed commit isn't retried; locking; rollback (prev / yesterday / commit) leaves local files untouched; the remote `main` is never changed; protected branches are refused; config values are never executed.
 
 ## Non-goals

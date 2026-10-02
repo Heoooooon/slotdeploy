@@ -10,7 +10,7 @@
 
 ![slotdeploy 演示：正常修改会上线，构建失败的修改会被拒绝，页面保持上一个版本](demo/demo.gif)
 
-- 只有两个 bash 脚本（`bin/slotdeploy`、`bin/slotdeploy-push`），只依赖 `bash`、`git` 和 `curl`。
+- Bash 命令（`bin/slotdeploy`、`bin/slotdeploy-push`）和初始化助手；运行只依赖 `bash`、`git` 和 `curl`。
 - 服务器通过 systemd 定时器（Linux）或 launchd（macOS）每分钟检查一次 `preview` 分支。
 - 在 macOS 自带的 bash 3.2 上也能运行。
 
@@ -40,8 +40,46 @@ slotdeploy-push push "修改横幅"            slotdeploy watch  (每分钟)
 
 ```bash
 git clone https://github.com/Heoooooon/slotdeploy.git
-sudo install -m 755 slotdeploy/bin/slotdeploy slotdeploy/bin/slotdeploy-push /usr/local/bin/
+sh slotdeploy/install.sh --source slotdeploy
 ```
+
+一行安装（默认 `~/.local/bin`，不需要 sudo）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Heoooooon/slotdeploy/main/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://raw.githubusercontent.com/Heoooooon/slotdeploy/main/install.sh | sh -s -- update
+curl -fsSL https://raw.githubusercontent.com/Heoooooon/slotdeploy/main/install.sh | sh -s -- uninstall
+```
+
+用 `--bin-dir` 指定安装位置，`--ref <分支/标签/提交>` 选择版本，默认跟踪 `main`。卸载保留配置、定时器和已部署站点。
+
+## 快速初始化 (v0.2.0)
+
+`slotdeploy init` 会询问仓库、目录、分支、构建/重启命令、健康 URL 和定时器。非交互方式：
+
+```bash
+slotdeploy -c "$HOME/site/slotdeploy.env" init --yes \
+  --repo git@github.com:example/site.git --root "$HOME/site" \
+  --install 'npm ci' --build 'npm run build' \
+  --health-url http://127.0.0.1:3000/ --timer systemd
+```
+
+配置以权限 600 创建，不覆盖已有文件。`--timer systemd` 写入 `~/.config/systemd/user`；`--timer launchd` 写入 `~/Library/LaunchAgents`；`--timer none` 只创建配置。支持 `--timer-dir`、`--every 60`、`--name` 和 `--check`。**只生成，不激活**；执行输出的激活命令，首次部署手动确认。systemd 用户定时器要在退出登录后继续运行，需 `loginctl enable-linger "$USER"`。launchd 用户代理在登录期间运行。
+
+## 通知
+
+通过 **watcher 的环境变量**配置，不要写进 Git 或 `slotdeploy.env`：
+
+| 服务 | 环境变量 |
+|---|---|
+| Telegram | `SLOTDEPLOY_TELEGRAM_URL`（完整 `/sendMessage` URL）、`SLOTDEPLOY_TELEGRAM_CHAT_ID` |
+| Discord | `SLOTDEPLOY_DISCORD_URL` |
+| Slack | `SLOTDEPLOY_SLACK_URL` |
+
+发送 `success`、`failure`，重启/健康检查失败并恢复原运行槽位时额外发送 `rollback`。客户端 rollback 只移动分支，watcher 随后通知部署结果。通知失败不改变部署结果。请求有超时限制，只发送分支、提交、槽位及失败阶段；秘密 URL、聊天 ID 和响应不进入日志，构建进程也不会收到通知凭据。
+
+systemd 使用私有 `EnvironmentFile=` 服务 drop-in；launchd 使用私有 `EnvironmentVariables`，或在加载前 `launchctl setenv`。修改环境后重新加载 watcher。不要把秘密粘贴到共享日志，也不要开启 shell 跟踪。
 
 ## 服务器配置
 
@@ -112,6 +150,16 @@ slotdeploy-push rollback 1a2b3c4        # 回到指定提交
 当有人说“发布到 preview”或“把预览回滚到昨天”时，代理就会执行上面的命令。
 技能中写明：代理不做生产部署，发布到生产前必须请人确认。
 
+在克隆目录安装技能包：
+
+```bash
+mkdir -p "$HOME/.omo/agent/skills" "$HOME/.claude/skills"
+cp -R skills/omo/preview-deploy "$HOME/.omo/agent/skills/"
+cp -R skills/claude-code/preview-deploy "$HOME/.claude/skills/"
+```
+
+重新加载技能后说 **“发布到 preview”** / **"preview로 올려줘"**。技能区分 push 成功和服务器实际部署状态，不会编造未验证的预览 URL。
+
 ## 本地试用（无需服务器）
 
 ```bash
@@ -124,9 +172,10 @@ break_build; slotdeploy-push push "broken"; slotdeploy watch; site   # 页面保
 
 ```bash
 bash test/run.sh            # 真实的 bare git 远程仓库 + 会成功/失败的模拟构建
-shellcheck bin/* test/run.sh demo/sandbox.sh
+shellcheck bin/* install.sh test/*.sh demo/sandbox.sh
 ```
 
+测试额外需要 Python 3.12+（本地 HTTP 通知和 plist 验证）；运行脚本仍只需要 Bash、Git 和 curl。
 覆盖内容：构建、健康检查或检查失败时保留之前的版本;失败的提交不重试;锁;回滚（prev / yesterday / 提交）不改动本地文件;远程 `main` 不变;拒绝受保护分支;配置值不会被执行。
 
 ## 不做的事

@@ -10,7 +10,7 @@
 
 ![slotdeploy 데모: 정상 수정은 반영되고, 깨진 빌드는 거부되어 이전 화면이 유지됨](demo/demo.gif)
 
-- bash 스크립트 두 개(`bin/slotdeploy`, `bin/slotdeploy-push`). 필요한 건 `bash`, `git`, `curl`뿐입니다.
+- Bash 명령(`bin/slotdeploy`, `bin/slotdeploy-push`)과 초기화 도우미. 실행에는 `bash`, `git`, `curl`이 필요합니다.
 - 서버는 systemd 타이머(리눅스)나 launchd(macOS)로 1분마다 `preview` 브랜치를 확인합니다.
 - macOS 기본 bash 3.2에서도 동작합니다.
 
@@ -40,8 +40,46 @@ slotdeploy-push push "배너 수정"           slotdeploy watch  (1분마다)
 
 ```bash
 git clone https://github.com/Heoooooon/slotdeploy.git
-sudo install -m 755 slotdeploy/bin/slotdeploy slotdeploy/bin/slotdeploy-push /usr/local/bin/
+sh slotdeploy/install.sh --source slotdeploy
 ```
+
+한 줄 설치는 기본적으로 `~/.local/bin`을 사용하며 sudo가 필요 없습니다.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Heoooooon/slotdeploy/main/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://raw.githubusercontent.com/Heoooooon/slotdeploy/main/install.sh | sh -s -- update
+curl -fsSL https://raw.githubusercontent.com/Heoooooon/slotdeploy/main/install.sh | sh -s -- uninstall
+```
+
+`--bin-dir`로 설치 위치, `--ref <브랜치/태그/커밋>`으로 버전을 선택합니다. 기본은 `main`이며 제거 시 설정·타이머·배포 데이터는 보존합니다.
+
+## 빠른 초기화 (v0.2.0)
+
+`slotdeploy init`은 저장소·배포 폴더·브랜치·빌드/재시작 명령·헬스 URL·타이머를 질문합니다. 비대화형 예:
+
+```bash
+slotdeploy -c "$HOME/site/slotdeploy.env" init --yes \
+  --repo git@github.com:example/site.git --root "$HOME/site" \
+  --install 'npm ci' --build 'npm run build' \
+  --health-url http://127.0.0.1:3000/ --timer systemd
+```
+
+설정은 권한 600으로 만들고 기존 파일은 덮어쓰지 않습니다. `--timer systemd`는 `~/.config/systemd/user`, `--timer launchd`는 `~/Library/LaunchAgents`에 생성하고 `--timer none`은 설정만 만듭니다. `--timer-dir`, `--every 60`, `--name`, `--check`도 지원합니다. **생성만 하며 활성화하지 않습니다.** 출력된 활성화 명령을 실행하고 첫 배포는 직접 확인하세요. 로그아웃 뒤에도 systemd 사용자 타이머를 유지하려면 `loginctl enable-linger "$USER"`가 필요합니다. launchd 사용자 에이전트는 로그인 중 실행됩니다.
+
+## 알림
+
+설정 파일이나 Git이 아니라 **watcher의 환경 변수**로 지정합니다.
+
+| 서비스 | 환경 변수 |
+|---|---|
+| 텔레그램 | `SLOTDEPLOY_TELEGRAM_URL` (봇의 전체 `/sendMessage` URL), `SLOTDEPLOY_TELEGRAM_CHAT_ID` |
+| 디스코드 | `SLOTDEPLOY_DISCORD_URL` |
+| 슬랙 | `SLOTDEPLOY_SLACK_URL` |
+
+성공은 `success`, 실패는 `failure`, 재시작·헬스 실패로 이전 라이브 슬롯을 복구하면 추가로 `rollback`을 보냅니다. 클라이언트 `slotdeploy-push rollback`은 브랜치를 옮기며 watcher가 이후 배포 결과를 알립니다. 알림 실패는 배포 결과를 바꾸지 않습니다. 시간 제한을 두고 브랜치·커밋·슬롯·실패 단계만 전송하며 URL·채팅 비밀값·응답을 로그에 남기지 않습니다. 빌드 프로세스에는 알림 자격 증명을 전달하지 않습니다.
+
+systemd에는 권한 600의 별도 `EnvironmentFile=`을 사용자 서비스 drop-in으로 연결하고, launchd에는 비공개 `EnvironmentVariables` 또는 로드 전 `launchctl setenv`로 전달하세요. 환경 변경 후 watcher를 다시 로드하세요. 비밀값을 공유 로그에 붙이거나 셸 추적을 켜지 마세요.
 
 ## 서버 설정
 
@@ -112,6 +150,16 @@ slotdeploy-push rollback 1a2b3c4        # 특정 커밋으로
 "preview로 올려줘", "어제 상태로 돌려줘" 같은 말에 위 명령을 실행합니다.
 에이전트는 운영 배포를 하지 않고, 운영 반영은 사람에게 확인을 요청하도록 적혀 있습니다.
 
+복제한 저장소에서 패키지 스킬을 설치합니다.
+
+```bash
+mkdir -p "$HOME/.omo/agent/skills" "$HOME/.claude/skills"
+cp -R skills/omo/preview-deploy "$HOME/.omo/agent/skills/"
+cp -R skills/claude-code/preview-deploy "$HOME/.claude/skills/"
+```
+
+에이전트의 스킬을 다시 로드한 뒤 **"preview로 올려줘"**라고 요청하세요. push 성공과 서버 배포 확인을 구분하고, 확인하지 않은 미리보기 URL은 만들지 않습니다.
+
 ## 직접 해보기 (로컬, 서버 없이)
 
 ```bash
@@ -124,9 +172,10 @@ break_build; slotdeploy-push push "broken"; slotdeploy watch; site   # 이전 �
 
 ```bash
 bash test/run.sh            # 실제 bare git 원격 + 성공/실패하는 가짜 빌드
-shellcheck bin/* test/run.sh demo/sandbox.sh
+shellcheck bin/* install.sh test/*.sh demo/sandbox.sh
 ```
 
+테스트에는 Python 3.12 이상이 추가로 필요합니다(로컬 HTTP 알림·plist 검증). 실행 바이너리는 Bash·Git·curl만 필요합니다.
 검증하는 것: 빌드 실패·헬스 실패·검사 실패 시 이전 유지, 같은 실패 커밋 재시도 안 함, 잠금, 롤백(이전/어제/커밋) 시 작업 파일 불변, 원격 main 불변, 보호 브랜치 거부, 설정 값 비실행.
 
 ## 하지 않는 것
