@@ -3,6 +3,8 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/.." && pwd)
 T=$(mktemp -d "${TMPDIR:-/tmp}/slotdeploy-init-test.XXXXXX")
+# macOS temp roots may be symlinked or include a trailing slash.
+T=$(cd "$T" && pwd -P)
 trap 'rm -rf "$T"' EXIT
 fail() { printf 'FAIL init: %s\n' "$*" >&2; exit 1; }
 sd() { bash "$REPO/bin/slotdeploy" "$@"; }

@@ -78,7 +78,9 @@ case $every in '' | *[!0-9]* | 0) die "--every must be a positive integer" ;; es
 case $every in *[1-9]*) ;; *) die "--every must be a positive integer" ;; esac
 case $name in '' | *[!a-zA-Z0-9._-]*) die "--name must contain letters, digits, '.', '_' or '-'" ;; esac
 case $timer in systemd | launchd | none) ;; *) die "--timer must be systemd, launchd, or none" ;; esac
-[ ! -e "$config" ] && [ ! -L "$config" ] || die "config already exists"
+if [ -e "$config" ] || [ -L "$config" ]; then
+  die "config already exists"
+fi
 
 bin_dir=$(cd "$(dirname "$0")" && pwd)
 binary="$bin_dir/slotdeploy"
