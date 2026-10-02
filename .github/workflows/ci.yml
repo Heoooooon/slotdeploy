@@ -10,8 +10,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: shellcheck
         if: runner.os == 'Linux'
-        run: shellcheck bin/slotdeploy bin/slotdeploy-push test/run.sh demo/sandbox.sh
+        run: shellcheck bin/* install.sh test/*.sh demo/sandbox.sh
       - name: tests (real bare git remote, fake builds)
-        run: bash test/run.sh
+        run: |
+          # Force every nested bash invocation to the OS Bash, including 3.2 on macOS.
+          compat=$(mktemp -d)
+          trap 'rm -rf "$compat"' EXIT
+          ln -s /bin/bash "$compat/bash"
+          /bin/bash --version
+          PATH="$compat:$PATH" /bin/bash test/run.sh
